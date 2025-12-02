@@ -51,6 +51,32 @@ public class UserRepository {
         return users;
     }
 
+    // я уверен, что есть более лучшая реализация, чтобы каждый раз не проходится по БД
+    public User findUserById(long id) {
+        String sql = "SELECT * FROM users WHERE id = ?";
+
+        try (Connection conn = Database.connect();
+            PreparedStatement stmt = conn.prepareStatement(sql)) {
+
+            stmt.setLong(1, id);
+            ResultSet rs = stmt.executeQuery();
+
+            if (rs.next()) {
+                String username = rs.getString("username");
+                String email = rs.getString("email");
+                String pass = rs.getString("password");
+                return new User(rs.getLong("id"), username, email, pass);
+            } else {
+                throw new RuntimeException("404 Not Found");
+            }
+
+        } catch (SQLException e) {
+            e.printStackTrace();
+            throw new RuntimeException("Error fetching user");
+        }
+
+    }
+
     public void update(User user) {
         String sql = "UPDATE users SET username = ?, email = ?, password = ? WHERE id = ?";
 
