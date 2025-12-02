@@ -1,3 +1,4 @@
+import database.Database;
 import http.*;
 
 import java.io.ByteArrayOutputStream;
@@ -21,6 +22,8 @@ public class Main {
     private static final ExecutorService executor = Executors.newCachedThreadPool();
 
     public static void main(String[] args) throws IOException {
+
+        Database.initialize();
 
         ServerSocketChannel serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(8080));
@@ -54,7 +57,7 @@ public class Main {
     }
 
     private static void initRouters() {
-        router.register("/api/", new ApiHandler());
+        router.register("/api/users/", new UsersHandler());
         router.register("/login/", new LoginHandler());
         router.register("/", new StaticFileHandler());
     }

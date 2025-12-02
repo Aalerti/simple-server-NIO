@@ -4,13 +4,27 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
+import database.UserRepository;
+import model.User;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
-public class ApiHandler implements Handler {
+public class UsersHandler implements Handler {
 
+    private static final UserRepository userRepository = new UserRepository();
     private static final Gson gson = new Gson();
+
+    private static class UserResponse {
+        String status;
+        User user;
+
+        public UserResponse(String status, User user) {
+            this.status = status;
+            this.user = user;
+        }
+    }
 
     @Override
     public HttpResponse handle(HttpRequest request) {
@@ -18,7 +32,11 @@ public class ApiHandler implements Handler {
 
 
         if (method == HttpMethods.GET) {
-            return new HttpResponse("200 OK", "text/html", "{\"message\": \"Welcome to my api, It was a get request\"}");
+
+            List<User> users = userRepository.findAll();
+            String jsonOutput = gson.toJson(users);
+            return new HttpResponse("200 OK", "application/json", jsonOutput);
+
         } else if (method == HttpMethods.POST) {
 
             byte[] body = request.getBody();
@@ -30,18 +48,16 @@ public class ApiHandler implements Handler {
             String contentType = headers.get("Content-Type");
 
             if (contentType != null && contentType.contains("application/json")) {
-                String bodyString = new String(body, StandardCharsets.UTF_8);
-
                 try {
-                    JsonObject jsonRequest = JsonParser.parseString(bodyString).getAsJsonObject();
+                    String bodyString = new String(body, StandardCharsets.UTF_8);
+                    User user = gson.fromJson(bodyString, User.class);
+                    userRepository.save(user);
 
-                    JsonObject jsonResponse = new JsonObject();
-                    jsonResponse.addProperty("status", "created");
-                    jsonResponse.add("received_data", jsonRequest);
+                    String jsonOutput = gson.toJson(new UserResponse("created", user));
 
-                    return new HttpResponse("200 OK", "application/json", gson.toJson(jsonResponse));
+                    return new HttpResponse("200 OK", "application/json", jsonOutput);
 
-                } catch (JsonSyntaxException e) {
+                } catch (JsonSyntaxException | IllegalArgumentException ex) {
                     return new HttpResponse("400 Bad Request", "application/json", "{\"error\": \"Invalid JSON syntax\"}");
                 }
             }
