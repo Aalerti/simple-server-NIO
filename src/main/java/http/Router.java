@@ -14,20 +14,20 @@ public class Router {
         handlers.put(path, handler);
     }
 
-    public byte[] handle(HttpRequest  request) {
+    public HttpResponse handle(HttpRequest  request) {
         String path = request.getPath();
         if (handlers.containsKey(path)) {
             HttpResponse httpResponse = handlers.get(path).handle(request);
-            return httpResponse.getBytes();
+            return httpResponse;
         }
         else {
             for (Map.Entry<String, Handler> entry : handlers.entrySet()) {
                 if (path.contains(entry.getKey())) {
                     HttpResponse httpResponse = handlers.get(entry.getKey()).handle(request);
-                    return httpResponse.getBytes();
+                    return httpResponse;
                 }
             }
         }
-        return new HttpResponse("404 Not Found", "text/html", "Error").getBytes();
+        return new HttpResponse("404 Not Found", "text/html", "Error");
     }
 }

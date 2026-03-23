@@ -1,5 +1,8 @@
+import com.google.gson.JsonObject;
 import database.Database;
 import http.*;
+import utils.JsonLogger;
+import utils.Metrics;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -15,42 +18,59 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class Main {
 
     private static final Router router = new Router();
     private static final ExecutorService executor = Executors.newCachedThreadPool();
 
+    private static volatile boolean isRunning = true;
+    private static Selector selector;
+    private static ServerSocketChannel serverChannel;
+
     public static void main(String[] args) throws IOException {
 
         Database.initialize();
 
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(8080));
         serverChannel.configureBlocking(false);
 
-        Selector selector = Selector.open();
-
+        selector = Selector.open();
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
         initRouters();
+        setupShutdownHook();
 
-        while (true) {
-            selector.select();
+        JsonLogger.info("Server started on port 8080");
 
-            Set<SelectionKey> selectionKeys = selector.selectedKeys();
-            Iterator<SelectionKey> iterator = selectionKeys.iterator();
+        while (isRunning) {
+            try {
+                selector.select();
 
-            while (iterator.hasNext()) {
-                SelectionKey key = iterator.next();
-                iterator.remove();
+                if (!isRunning) {
+                    break;
+                }
 
-                if (key.isAcceptable()) {
-                    handleAccept(serverChannel, selector);
+                Set<SelectionKey> selectionKeys = selector.selectedKeys();
+                Iterator<SelectionKey> iterator = selectionKeys.iterator();
 
-                } else if (key.isReadable()) {
-                    handleRead(key);
+                while (iterator.hasNext()) {
+                    SelectionKey key = iterator.next();
+                    iterator.remove();
 
+                    if (!key.isValid()) continue;
+
+                    if (key.isAcceptable()) {
+                        handleAccept(serverChannel, selector);
+                    } else if (key.isReadable()) {
+                        handleRead(key);
+                    }
+                }
+            } catch (IOException e) {
+                if (isRunning) {
+                    JsonLogger.error("Error in Event Loop", e);
                 }
             }
         }
@@ -59,7 +79,51 @@ public class Main {
     private static void initRouters() {
         router.register("/api/users/", new UsersHandler());
         router.register("/login/", new LoginHandler());
+        router.register("/health", new HealthHandler());
+        router.register("/metrics", new MetricsHandler());
         router.register("/", new StaticFileHandler());
+    }
+
+    private static void setupShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            JsonLogger.info("Received SIGTERM. Initiating Graceful Shutdown...");
+            isRunning = false;
+
+            try {
+                if (selector != null) {
+                    selector.wakeup();
+                }
+
+                if (serverChannel != null) {
+                    serverChannel.close();
+                }
+
+                if (selector != null) {
+                    for (SelectionKey key : selector.keys()) {
+                        try {
+                            key.channel().close();
+                        } catch (IOException e) {
+                        }
+                    }
+                    selector.close();
+                    JsonLogger.info("Selector and ServerSocketChannel closed.");
+                }
+
+                executor.shutdown();
+                JsonLogger.info("Awaiting Shutdown...");
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    JsonLogger.error("Thread pool termination timeout. Forcing shutdown.");
+                    executor.shutdownNow();
+                } else {
+                    JsonLogger.info("All active tasks completed successfully.");
+                }
+
+            } catch (Exception e) {
+                JsonLogger.error("Error during Graceful Shutdown", e);
+            }
+
+            JsonLogger.info("Server completely stopped.");
+        }));
     }
 
     private static void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
@@ -133,13 +197,43 @@ public class Main {
     }
 
     private static void processRequest(byte[] copyBytesOfRequest, SocketChannel clientChannel) {
-        CompletableFuture<Void> futureResponse = CompletableFuture.supplyAsync(() -> new HttpRequest(copyBytesOfRequest), executor)
-                .thenApply(router::handle)
-                .exceptionally(ex -> {
-                    System.err.println("Ошибка обработки: " + ex.getMessage());
-                    return new HttpResponse("500 Internal Server Error", "text/plain", "Internal Error").getBytes();
+        long startTime = System.nanoTime();
+
+        CompletableFuture<Void> futureResponse = CompletableFuture.supplyAsync(() -> {
+                    HttpRequest req = new HttpRequest(copyBytesOfRequest);
+
+                    JsonObject context = new JsonObject();
+                    context.addProperty("method", req.getMethod().toString());
+                    context.addProperty("path", req.getPath());
+                    JsonLogger.info("Incoming HTTP request", context);
+
+                    return req;
+                }, executor)
+                .thenApply(req -> {
+                    HttpResponse response = router.handle(req);
+                    String statusCode = response.getStatus().split(" ")[0];
+                    Metrics.registry
+                            .timer("http_server_requests_seconds",
+                                    "method", req.getMethod().name(),
+                                    "status", statusCode)
+                            .record(System.nanoTime() - startTime, java.util.concurrent.TimeUnit.NANOSECONDS);
+
+                    return response;
+
                 })
-                .thenAccept(responseBytes -> {
+                .exceptionally(ex -> {
+                    Metrics.registry.timer("http_server_requests_seconds",
+                                    "method", "UNKNOWN",
+                                    "status", "500")
+                            .record(System.nanoTime() - startTime, java.util.concurrent.TimeUnit.NANOSECONDS);
+
+
+                    JsonLogger.error("Request processing failed", ex);
+                    return new HttpResponse("500 Internal Server Error", "text/plain", "Internal Error");
+                })
+                .thenAccept(response -> {
+                    byte[] responseBytes = response.getBytes();
+
                     if (responseBytes != null) {
                         ByteBuffer writeBuffer = ByteBuffer.wrap(responseBytes);
                         try {

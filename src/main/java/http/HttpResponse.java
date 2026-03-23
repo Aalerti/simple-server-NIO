@@ -41,4 +41,8 @@ public class HttpResponse {
             return new byte[0];
         }
     }
+
+    public String getStatus() {
+        return status;
+    }
 }
