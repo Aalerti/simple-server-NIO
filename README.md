@@ -1,7 +1,7 @@
-# 🖥️ SimpleServer — Java NIO HTTP Server
+# 🖥️ SimpleServer — Java NIO HTTP Server (SRE-Ready)
 
 > Самописный HTTP-сервер на чистой Java без каких-либо фреймворков.  
-> Реализован с использованием **Java NIO (Non-blocking I/O)**, **H2 Database** и **REST API** архитектуры.
+> Реализован с использованием **Java NIO (Non-blocking I/O)**, **H2 Database**, **REST API** архитектуры и современных **SRE-практик** (Observability & Reliability).
 
 ---
 
@@ -16,6 +16,8 @@
 - REST API для управления пользователями (CRUD)
 - Раздача статических файлов (HTML, CSS, JS, изображения)
 - Персистентное хранение данных в H2 Database
+- **Reliability:** Корректное завершение работы (Graceful Shutdown) и Liveness-пробы (`/health`)
+- **Observability:** Структурированное JSON-логирование и сбор RED-метрик (Micrometer + Prometheus)
 
 ---
 
@@ -28,6 +30,9 @@
 | **CompletableFuture** | Асинхронная обработка запросов |
 | **H2 Database** | Встроенная реляционная база данных |
 | **Gson** | Сериализация/десериализация JSON |
+| **Micrometer** | Фасад для сбора application-метрик (Timer, Counter) |
+| **Prometheus & Grafana** | Time-series СУБД для метрик и визуализация дашбордов |
+| **Docker & Compose** | Изоляция среды и запуск инфраструктуры |
 | **Maven** | Управление зависимостями и сборкой |
 
 ---
@@ -57,20 +62,138 @@ SimpleServer/
 │       └── Validators.java         # Валидация username, email, password
 ├── static/
 │   └── index.html                  # Главная страница (отдаётся сервером)
+├── docker-compose.yml              # Оркестрация сервера, Prometheus, Grafana
+├── prometheus.yml                  # Конфигурация сбора метрик
 ├── pom.xml
 └── README.md
 ```
 
 ---
 
+## 🏗️ Архитектура системы
+
+Ниже представлена полная диаграмма потока запроса — от клиента до базы данных и мониторинга:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          CLIENT (HTTP)                              │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │ TCP-соединение (порт 8080)
+                          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     NIO EVENT LOOP (Main Thread)                    │
+│                                                                     │
+│   ┌──────────────┐      OP_ACCEPT     ┌────────────────────────┐   │
+│   │ ServerSocket │ ─────────────────► │       Selector         │   │
+│   │   Channel    │                    │                        │   │
+│   └──────────────┘      OP_READ       │  следит за ВСЕМИ       │   │
+│                         ◄─────────── │  соединениями сразу    │   │
+│                                       └───────────┬────────────┘   │
+└───────────────────────────────────────────────────┼────────────────┘
+                                                    │ данные готовы
+                                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   THREAD POOL (ExecutorService)                     │
+│                                                                     │
+│  CompletableFuture.supplyAsync()  →  thenApply()  →  thenAccept()  │
+│         │                                │                │        │
+│    [parse bytes]                   [route request]  [write response]│
+│    HttpRequest                        Router            SocketChannel│
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+              ┌────────────┴──────────────┐
+              ▼                           ▼
+┌─────────────────────┐     ┌──────────────────────────────────┐
+│      HANDLERS       │     │         OBSERVABILITY            │
+│                     │     │                                  │
+│ /api/users/         │     │  GET /health  →  {"status":"UP"} │
+│   UsersHandler      │     │  GET /metrics →  Prometheus fmt  │
+│                     │     │                                  │
+│ /login/             │     │  Structured JSON Logging         │
+│   LoginHandler      │     │  (ELK-ready, ISO 8601 UTC)       │
+│                     │     └──────────────┬───────────────────┘
+│ /static/*           │                    │ scrape
+│   StaticFileHandler │                    ▼
+└────────┬────────────┘     ┌──────────────────────────────────┐
+         │ JDBC             │         PROMETHEUS               │
+         ▼                  │   (time-series метрики)          │
+┌─────────────────────┐     └──────────────┬───────────────────┘
+│    H2 DATABASE      │                    │
+│                     │                    ▼
+│  TABLE: users       │     ┌──────────────────────────────────┐
+│  - id (PK)          │     │           GRAFANA                │
+│  - username         │     │   Дашборды: RPS, Latency, Errors │
+│  - email            │     └──────────────────────────────────┘
+│  - password         │
+└─────────────────────┘
+```
+
+### Жизненный цикл одного запроса
+
+```
+1. CLIENT          → TCP SYN → ServerSocketChannel
+2. Selector        → OP_ACCEPT → регистрирует SocketChannel + ByteArrayOutputStream
+3. Selector        → OP_READ  → читает байты в ByteBuffer (1024 byte chunks)
+4. isRequestComplete() → проверяет наличие \r\n\r\n и Content-Length
+5. ExecutorService → CompletableFuture.supplyAsync(new HttpRequest(bytes))
+6. HttpRequest     → парсит метод, путь, заголовки, тело
+7. Router          → ищет Handler по точному совпадению → затем по частичному
+8. Handler         → бизнес-логика → UserRepository → H2 Database
+9. HttpResponse    → сериализует статус + заголовки + тело в байты
+10. SocketChannel  → write(ByteBuffer) → close()
+```
+
+---
+
 ## 🚀 Быстрый старт
 
-### Требования
+### Вариант 1: Docker Compose (рекомендуется)
+
+Запускает сервер вместе с Prometheus и Grafana одной командой. Никаких предустановленных зависимостей, кроме Docker.
+
+#### Требования
+
+- **Docker** и **Docker Compose**
+
+#### Запуск
+
+```bash
+# 1. Клонировать репозиторий
+git clone https://github.com/your-username/SimpleServer.git
+cd SimpleServer
+
+# 2. Поднять весь стек одной командой
+docker compose up --build
+```
+
+#### Доступные сервисы
+
+| Сервис | Адрес | Описание |
+|---|---|---|
+| 🌐 **HTTP-сервер** | http://localhost:8080 | Основное приложение |
+| 📊 **Grafana** | http://localhost:3000 | Дашборды (admin / admin) |
+| 📈 **Prometheus** | http://localhost:9090 | Raw-метрики |
+
+#### Остановка
+
+```bash
+# Остановить все контейнеры
+docker compose down
+
+# Остановить и удалить volumes (данные метрик)
+docker compose down -v
+```
+
+---
+
+### Вариант 2: Локальный запуск (без Docker)
+
+#### Требования
 
 - **Java 21+**
 - **Maven 3.8+**
 
-### Запуск
+#### Запуск
 
 ```bash
 # 1. Клонировать репозиторий
@@ -88,7 +211,111 @@ mvn exec:java -Dexec.mainClass="Main"
 
 ---
 
+## 🛡️ SRE & Production-Readiness
+
+В проекте применены инженерные практики для обеспечения надёжности и наблюдаемости системы.
+
+### Graceful Shutdown
+
+При получении сигнала `SIGTERM` (например, от Kubernetes при деплое или `docker stop`) сервер **не обрывает соединения резко**, а завершает работу корректно:
+
+```
+SIGTERM получен
+    │
+    ├─► ServerSocketChannel.close()    # перестаём принимать НОВЫЕ соединения
+    │
+    ├─► активные SocketChannel-ы       # корректно закрываем текущие соединения
+    │
+    └─► ExecutorService.shutdown()     # ждём завершения текущих задач (5 сек)
+            │
+            └─► awaitTermination(5, SECONDS)
+                    │
+                    ├─ [успех] → все транзакции БД завершены, выход 0
+                    └─ [таймаут] → shutdownNow() → принудительное завершение
+```
+
+Это критично в production: без Graceful Shutdown запрос, который уже читает из БД, может получить `ConnectionResetException` на стороне клиента.
+
+---
+
+### Structured JSON Logging
+
+Вместо обычного текста логи пишутся в машиночитаемом формате JSON — это делает их совместимыми с ELK-стеком (Elasticsearch + Logstash + Kibana):
+
+```json
+{
+  "timestamp": "2025-01-15T14:32:01.123Z",
+  "level": "INFO",
+  "thread": "pool-1-thread-3",
+  "message": "Request handled",
+  "context": {
+    "method": "GET",
+    "path": "/api/users/",
+    "status": 200,
+    "duration_ms": 4
+  }
+}
+```
+
+Каждое событие содержит UTC-таймстемп в формате ISO 8601, имя потока (для диагностики race condition-ов) и контекст запроса.
+
+---
+
+### RED-метрики (Prometheus + Micrometer)
+
+Сбор метрик реализован по методологии **RED** — стандарту SRE-инженеров:
+
+| Буква | Метрика | Описание |
+|---|---|---|
+| **R** — Rate | `http_requests_total` | Запросов в секунду (RPS) |
+| **E** — Errors | `http_errors_total` | Количество ответов 4xx / 5xx |
+| **D** — Duration | `http_request_duration_seconds` | Время обработки запроса (гистограмма) |
+
+Защита от **Cardinality Explosion**: вместо записи полного URL в метку (что привело бы к миллионам уникальных рядов данных) используется только базовый путь: `/api/users/` вместо `/api/users/123`.
+
+Пример raw-метрик на эндпоинте `/metrics`:
+
+```
+# HELP http_requests_total Total number of HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{method="GET",path="/api/users/",status="200"} 1547.0
+
+# HELP http_request_duration_seconds Request duration
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005"} 1389.0
+http_request_duration_seconds_bucket{le="0.01"}  1521.0
+http_request_duration_seconds_bucket{le="+Inf"}  1547.0
+```
+
+---
+
+### Health Checks
+
+Эндпоинт `/health` используется балансировщиками нагрузки (Nginx, Kubernetes Liveness Probe) для проверки состояния сервера:
+
+```http
+GET /health HTTP/1.1
+Host: localhost:8080
+```
+
+```json
+{ "status": "UP" }
+```
+
+Если сервер не отвечает на `/health` — балансировщик исключает его из пула и трафик уходит на здоровые инстансы.
+
+---
+
 ## 📡 API Reference
+
+### Системные эндпоинты
+
+| Эндпоинт | Метод | Описание |
+|---|---|---|
+| `/health` | GET | Liveness-проба: `{"status": "UP"}` |
+| `/metrics` | GET | Prometheus-метрики (RPS, Latency, Errors) |
+
+---
 
 ### Пользователи `/api/users/`
 
@@ -273,6 +500,13 @@ router.register("/",           new StaticFileHandler());
     <artifactId>h2</artifactId>
     <version>2.2.224</version>
 </dependency>
+
+<!-- Micrometer — фасад для метрик -->
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+    <version>1.12.0</version>
+</dependency>
 ```
 
 ---
@@ -286,6 +520,8 @@ router.register("/",           new StaticFileHandler());
 - Построение REST API без фреймворков
 - Работа с JDBC и подготовленными запросами (`PreparedStatement`)
 - Разделение ответственности: Router, Handler, Repository, Model
+- SRE-практики: Graceful Shutdown, Health Checks, RED-метрики
+- Контейнеризация приложения и инфраструктуры мониторинга
 
 ---
 
